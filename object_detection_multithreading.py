@@ -2,14 +2,15 @@ import os
 import cv2
 import time
 import argparse
-import multiprocessing
 import numpy as np
+import subprocess as sp
+import json
 import tensorflow as tf
 
-from utils.app_utils import FPS, WebcamVideoStream, HLSVideoStream
-from multiprocessing import Queue, Pool
+from queue import Queue
+from threading import Thread
+from utils.app_utils import FPS, HLSVideoStream, WebcamVideoStream, draw_boxes_and_labels
 from object_detection.utils import label_map_util
-from object_detection.utils import visualization_utils as vis_util
 
 CWD_PATH = os.getcwd()
 
@@ -49,15 +50,14 @@ def detect_objects(image_np, sess, detection_graph):
         feed_dict={image_tensor: image_np_expanded})
 
     # Visualization of the results of a detection.
-    vis_util.visualize_boxes_and_labels_on_image_array(
-        image_np,
-        np.squeeze(boxes),
-        np.squeeze(classes).astype(np.int32),
-        np.squeeze(scores),
-        category_index,
-        use_normalized_coordinates=True,
-        line_thickness=8)
-    return image_np
+    rect_points, class_names, class_colors = draw_boxes_and_labels(
+        boxes=np.squeeze(boxes),
+        classes=np.squeeze(classes).astype(np.int32),
+        scores=np.squeeze(scores),
+        category_index=category_index,
+        min_score_thresh=.5
+    )
+    return dict(rect_points=rect_points, class_names=class_names, class_colors=class_colors)
 
 
 def worker(input_q, output_q):
@@ -85,47 +85,60 @@ def worker(input_q, output_q):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-str', '--stream', dest="stream", action='store', type=str, default=None)
+    parser.add_argument('-strin', '--stream-input', dest="stream_in", action='store', type=str, default=None)
     parser.add_argument('-src', '--source', dest='video_source', type=int,
                         default=0, help='Device index of the camera.')
     parser.add_argument('-wd', '--width', dest='width', type=int,
-                        default=480, help='Width of the frames in the video stream.')
+                        default=640, help='Width of the frames in the video stream.')
     parser.add_argument('-ht', '--height', dest='height', type=int,
-                        default=360, help='Height of the frames in the video stream.')
-    parser.add_argument('-num-w', '--num-workers', dest='num_workers', type=int,
-                        default=2, help='Number of workers.')
-    parser.add_argument('-q-size', '--queue-size', dest='queue_size', type=int,
-                        default=5, help='Size of the queue.')
+                        default=480, help='Height of the frames in the video stream.')
+    parser.add_argument('-strout','--stream-output', dest="stream_out", help='The URL to send the livestreamed object detection to.')
     args = parser.parse_args()
 
-    logger = multiprocessing.log_to_stderr()
-    logger.setLevel(multiprocessing.SUBDEBUG)
+    input_q = Queue(1)  # fps is better if queue is higher but then more lags
+    output_q = Queue()
+    for i in range(1):
+        t = Thread(target=worker, args=(input_q, output_q))
+        t.daemon = True
+        t.start()
 
-    input_q = Queue(maxsize=args.queue_size)
-    output_q = Queue(maxsize=args.queue_size)
-    pool = Pool(args.num_workers, worker, (input_q, output_q))
-
-
-    if (args.stream):
+    if (args.stream_in):
         print('Reading from hls stream.')
-        video_capture = HLSVideoStream(src=args.stream).start()
+        video_capture = HLSVideoStream(src=args.stream_in).start()
     else:
         print('Reading from webcam.')
         video_capture = WebcamVideoStream(src=args.video_source,
                                       width=args.width,
                                       height=args.height).start()
-
-    
     fps = FPS().start()
 
-    while True:  # fps._numFrames < 120
+    while True:
         frame = video_capture.read()
         input_q.put(frame)
 
         t = time.time()
 
-        output_rgb = cv2.cvtColor(output_q.get(), cv2.COLOR_RGB2BGR)
-        cv2.imshow('Video', output_rgb)
+        if output_q.empty():
+            pass  # fill up queue
+        else:
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            data = output_q.get()
+            rec_points = data['rect_points']
+            class_names = data['class_names']
+            class_colors = data['class_colors']
+            for point, name, color in zip(rec_points, class_names, class_colors):
+                cv2.rectangle(frame, (int(point['xmin'] * args.width), int(point['ymin'] * args.height)),
+                              (int(point['xmax'] * args.width), int(point['ymax'] * args.height)), color, 3)
+                cv2.rectangle(frame, (int(point['xmin'] * args.width), int(point['ymin'] * args.height)),
+                              (int(point['xmin'] * args.width) + len(name[0]) * 6,
+                               int(point['ymin'] * args.height) - 10), color, -1, cv2.LINE_AA)
+                cv2.putText(frame, name[0], (int(point['xmin'] * args.width), int(point['ymin'] * args.height)), font,
+                            0.3, (0, 0, 0), 1)
+            if args.stream_out:
+                print('Streaming elsewhere!')
+            else:
+                cv2.imshow('Video', frame)
+
         fps.update()
 
         print('[INFO] elapsed time: {:.2f}'.format(time.time() - t))
@@ -137,6 +150,5 @@ if __name__ == '__main__':
     print('[INFO] elapsed time (total): {:.2f}'.format(fps.elapsed()))
     print('[INFO] approx. FPS: {:.2f}'.format(fps.fps()))
 
-    pool.terminate()
     video_capture.stop()
     cv2.destroyAllWindows()
